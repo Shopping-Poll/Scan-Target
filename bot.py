@@ -146,22 +146,29 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), check_duplicate))
 
 # 6. Webhook Routes
-@app.route('/', methods=['GET'])
+@app.route('/', methods=['GET', 'HEAD'])
 def index():
+    """Home route for Render health checks"""
     return "Bot is running via Webhook!", 200
 
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 async def webhook():
     """Handle incoming Telegram updates"""
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        await telegram_app.process_update(update)
-        return "OK", 200
+    try:
+        if request.method == "POST":
+            update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+            await telegram_app.process_update(update)
+            return "OK", 200
+    except Exception as e:
+        logger.error(f"❌ Webhook Error: {e}")
+        return "Internal Error", 500
+    return "Invalid Request", 400
 
 # 7. Helper for setting webhook automatically
 async def start_bot():
     """Initialize and start the telegram app"""
     try:
+        logger.info("🚀 Starting bot initialization...")
         await telegram_app.initialize()
         await telegram_app.start()
         
@@ -170,9 +177,11 @@ async def start_bot():
             full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
             await bot.set_webhook(url=full_url)
             logger.info(f"🌐 Webhook set/verified: {full_url}")
+        else:
+            logger.warning("⚠️ WEBHOOK_URL not set, skipping webhook registration")
             
     except Exception as e:
-        logger.error(f"❌ Initialization failed: {e}")
+        logger.error(f"❌ Initialization failed: {e}", exc_info=True)
 
 # Use a lock to ensure only one worker/thread initializes the bot
 init_lock = asyncio.Lock()
