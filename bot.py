@@ -47,9 +47,18 @@ class ProductionDuplicateBot:
     def __init__(self):
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
         load_dotenv(env_path)
-        self.token = os.getenv('BOT_TOKEN')
+        self.token = os.getenv('BOT_TOKEN', '').strip()
         if not self.token:
             raise ValueError("❌ BOT_TOKEN environment variable not set")
+            
+        # Network Check
+        try:
+            import socket
+            hostname = "api.telegram.org"
+            ip = socket.gethostbyname(hostname)
+            logger.info(f"🌐 DNS Check: {hostname} resolved to {ip}")
+        except Exception as e:
+            logger.warning(f"⚠️ DNS Check Failed for {hostname}: {e}")
             
         self.app = Application.builder().token(self.token).build()
         self.setup_database()
