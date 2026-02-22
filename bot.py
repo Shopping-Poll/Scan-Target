@@ -178,5 +178,7 @@ if WEBHOOK_URL:
         logger.error(f"⚠️ Webhook setup failed: {e}")
 
 if __name__ == "__main__":
-    # Local usage only
-    app.run(port=7860)
+    # Render and other hosts provide a PORT environment variable
+    port = int(os.environ.get("PORT", 7860))
+    # Must bind to 0.0.0.0 to be accessible externally
+    app.run(host='0.0.0.0', port=port)
