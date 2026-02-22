@@ -151,24 +151,46 @@ def index():
     """Home route for Render health checks"""
     return "Bot is running via Webhook!", 200
 
+@app.route('/health', methods=['GET'])
+def health():
+    """Detailed health check"""
+    status = {
+        "status": "ok",
+        "database": "unknown",
+        "initialized": is_initialized
+    }
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        conn.close()
+        status["database"] = "connected"
+    except Exception as e:
+        status["database"] = f"error: {str(e)}"
+        status["status"] = "error"
+    return jsonify(status), 200 if status["status"] == "ok" else 500
+
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 async def webhook():
     """Handle incoming Telegram updates"""
     try:
+        logger.info(f"📥 Received webhook request on /{BOT_TOKEN[:5]}...")
         if request.method == "POST":
-            update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+            data = request.get_json(force=True)
+            update = Update.de_json(data, telegram_app.bot)
             await telegram_app.process_update(update)
             return "OK", 200
     except Exception as e:
-        logger.error(f"❌ Webhook Error: {e}", exc_info=True)
-        return "Internal Error", 500
+        logger.error(f"❌ Webhook Logic Error: {e}", exc_info=True)
+        return f"Internal Error: {str(e)}", 500
     return "Invalid Request", 400
 
 # 7. Helper for setting webhook automatically
 async def start_bot():
     """Initialize and start the telegram app"""
     try:
-        logger.info("🚀 Starting bot initialization...")
+        logger.info("🚀 Starting bot initialization sequence...")
+        # Check if already running to avoid "Already running" errors
         await telegram_app.initialize()
         await telegram_app.start()
         
@@ -176,12 +198,13 @@ async def start_bot():
             bot = telegram_app.bot
             full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
             await bot.set_webhook(url=full_url)
-            logger.info(f"🌐 Webhook set/verified: {full_url}")
+            logger.info(f"🌐 Webhook successfully set to: {full_url}")
         else:
-            logger.warning("⚠️ WEBHOOK_URL not set, skipping webhook registration")
+            logger.warning("⚠️ WEBHOOK_URL not set in environment variables!")
             
     except Exception as e:
-        logger.error(f"❌ Initialization failed: {e}", exc_info=True)
+        logger.error(f"❌ Initialization Traceback:", exc_info=True)
+        raise e
 
 # Use a lock to ensure only one worker/thread initializes the bot
 init_lock = asyncio.Lock()
@@ -190,14 +213,22 @@ is_initialized = False
 @app.before_request
 async def ensure_initialized():
     global is_initialized
+    # Skip initialization for health check if we want to debug health separately
+    if request.path == '/health':
+        return
+        
     if not is_initialized:
-        async with init_lock:
-            if not is_initialized:
-                await start_bot()
-                is_initialized = True
+        try:
+            async with init_lock:
+                if not is_initialized:
+                    await start_bot()
+                    is_initialized = True
+                    logger.info("✅ Bot initialization complete.")
+        except Exception as e:
+            logger.error(f"❌ before_request initialization failed: {e}", exc_info=True)
+            # We don't raise here so the request can still try to return an error page
+            # instead of a generic 500 without our logs.
 
 if __name__ == "__main__":
-    # Render and other hosts provide a PORT environment variable
     port = int(os.environ.get("PORT", 7860))
-    # Must bind to 0.0.0.0 to be accessible externally
     app.run(host='0.0.0.0', port=port)
