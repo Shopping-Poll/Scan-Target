@@ -22,4 +22,4 @@ ENV PATH="/home/user/.local/bin:${PATH}"
 WORKDIR /app
 COPY --chown=user . .
 
-CMD ["python", "bot.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:7860", "bot:app"]
