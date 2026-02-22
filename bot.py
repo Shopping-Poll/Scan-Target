@@ -54,6 +54,12 @@ def init_db():
                 user_name TEXT DEFAULT 'Unknown'
             )
         ''')
+        # Migration: Drop old unique constraint if it exists
+        try:
+            cursor.execute('ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_chat_id_message_hash_key')
+        except Exception:
+            pass
+            
         # Create an index for faster searching
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_hash ON messages(chat_id, message_hash)')
         conn.close()
