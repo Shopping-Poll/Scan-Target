@@ -11,16 +11,18 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
-
-# Create directory for data (Railway will mount a volume here)
-RUN mkdir -p /app/data && chown -R bot:bot /app/data
-
 # Create non-root user
 RUN groupadd -r bot && useradd -r -g bot bot
+
+# Create directory for data (Railway will mount a volume here)
+RUN mkdir -p /app/data && chown -R bot:bot /app/data /app
+
+# Copy application code
+COPY . .
 RUN chown -R bot:bot /app
+
 USER bot
+
 
 # Health check (simplified for Railway)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
