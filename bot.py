@@ -160,7 +160,7 @@ async def webhook():
             await telegram_app.process_update(update)
             return "OK", 200
     except Exception as e:
-        logger.error(f"❌ Webhook Error: {e}")
+        logger.error(f"❌ Webhook Error: {e}", exc_info=True)
         return "Internal Error", 500
     return "Invalid Request", 400
 
