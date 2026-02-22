@@ -159,23 +159,33 @@ async def webhook():
         return "OK", 200
 
 # 7. Helper for setting webhook automatically
-async def setup_webhook():
-    if WEBHOOK_URL:
-        bot = Bot(token=BOT_TOKEN)
-        full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        await bot.set_webhook(url=full_url)
-        logger.info(f"🌐 Webhook set to: {full_url}")
-
-# This will run once when the app starts
-if WEBHOOK_URL:
+async def start_bot():
+    """Initialize and start the telegram app"""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(setup_webhook())
-        else:
-            loop.run_until_complete(setup_webhook())
+        await telegram_app.initialize()
+        await telegram_app.start()
+        
+        if WEBHOOK_URL:
+            bot = telegram_app.bot
+            full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
+            await bot.set_webhook(url=full_url)
+            logger.info(f"🌐 Webhook set/verified: {full_url}")
+            
     except Exception as e:
-        logger.error(f"⚠️ Webhook setup failed: {e}")
+        logger.error(f"❌ Initialization failed: {e}")
+
+# Use a lock to ensure only one worker/thread initializes the bot
+init_lock = asyncio.Lock()
+is_initialized = False
+
+@app.before_request
+async def ensure_initialized():
+    global is_initialized
+    if not is_initialized:
+        async with init_lock:
+            if not is_initialized:
+                await start_bot()
+                is_initialized = True
 
 if __name__ == "__main__":
     # Render and other hosts provide a PORT environment variable

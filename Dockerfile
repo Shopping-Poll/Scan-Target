@@ -22,4 +22,5 @@ ENV PATH="/home/user/.local/bin:${PATH}"
 WORKDIR /app
 COPY --chown=user . .
 
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "bot:app"]
+# Render provides the PORT environment variable automatically
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-7860} bot:app"]
