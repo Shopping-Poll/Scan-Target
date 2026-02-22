@@ -1,4 +1,13 @@
-\# Telegram Duplicate Message Bot
+\---
+title: Telegram Duplicate Bot
+emoji: 🤖
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
+# Telegram Duplicate Message Bot
 
 
 

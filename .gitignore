@@ -7,5 +7,4 @@ __pycache__/
 node_modules/
 pm2.config.js
 telegram-bot.service
-docker-compose.yml
-Dockerfile
+

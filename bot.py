@@ -5,11 +5,27 @@ from dotenv import load_dotenv
 from telegram.ext import Application, MessageHandler, filters
 from telegram import Update
 import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import hashlib
 from datetime import datetime, timedelta
 import signal
 import sys
 import pytz
+import urllib.parse as urlparse
+from flask import Flask
+import threading
+
+# Flask app untuk health check (HuggingFace/Koyeb)
+server = Flask(__name__)
+
+@server.route('/')
+def health():
+    return "Bot is alive!", 200
+
+def run_server():
+    port = int(os.getenv('PORT', 7860))
+    server.run(host='0.0.0.0', port=port)
 
 # Setup logging
 try:
@@ -45,30 +61,54 @@ class ProductionDuplicateBot:
         logger.info("🤖 Bot initialized successfully")
         
     def setup_database(self):
-        """Setup database dengan path yang lebih baik"""
-        db_path = os.getenv('DB_PATH', 'messages.db')
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                message_hash TEXT,
-                message_text TEXT,
-                user_id INTEGER,
-                timestamp DATETIME,
-                UNIQUE(chat_id, message_hash)
-            )
-        ''')
+        """Setup database (PostgreSQL if DATABASE_URL exists, otherwise SQLite)"""
+        db_url = os.getenv('DATABASE_URL')
         
-        # Migrasi: Tambahkan kolom user_name jika belum ada
-        try:
-            cursor.execute('ALTER TABLE messages ADD COLUMN user_name TEXT DEFAULT "Unknown"')
-        except sqlite3.OperationalError:
-            pass # Kolom sudah ada
+        if db_url:
+            logger.info("🔌 Connecting to PostgreSQL (Supabase)...")
+            self.db_type = 'postgresql'
+            self.conn = psycopg2.connect(db_url)
+            self.conn.autocommit = True
+        else:
+            logger.info("📁 Connecting to SQLite...")
+            self.db_type = 'sqlite'
+            db_path = os.getenv('DB_PATH', 'messages.db')
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
             
-        self.conn.commit()
-        logger.info(f"📊 Database initialized at: {db_path}")
+        cursor = self.conn.cursor()
+        
+        if self.db_type == 'postgresql':
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT,
+                    message_hash TEXT,
+                    message_text TEXT,
+                    user_id BIGINT,
+                    timestamp TIMESTAMP,
+                    user_name TEXT DEFAULT 'Unknown',
+                    UNIQUE(chat_id, message_hash)
+                )
+            ''')
+        else:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER,
+                    message_hash TEXT,
+                    message_text TEXT,
+                    user_id INTEGER,
+                    timestamp DATETIME,
+                    UNIQUE(chat_id, message_hash)
+                )
+            ''')
+            # Migrasi SQLite: Tambahkan kolom user_name jika belum ada
+            try:
+                cursor.execute('ALTER TABLE messages ADD COLUMN user_name TEXT DEFAULT "Unknown"')
+            except sqlite3.OperationalError:
+                pass # Kolom sudah ada
+        
+        logger.info(f"📊 Database initialized ({self.db_type})")
         
     def setup_handlers(self):
         """Setup handler untuk pesan teks"""
@@ -122,27 +162,38 @@ class ProductionDuplicateBot:
             
             cursor = self.conn.cursor()
             
-            # Cek apakah pesan sudah pernah dikirim dalam 24 jam terakhir
-            cursor.execute('''
-                SELECT user_id, message_text, timestamp, user_name 
-                FROM messages 
-                WHERE chat_id = ? AND message_hash = ? 
-                AND timestamp > datetime('now', '-1 day')
-            ''', (chat_id, message_hash))
+            # Pengecekan 24 jam terakhir (Sintaks berbeda antara PG dan SQLite)
+            if self.db_type == 'postgresql':
+                query = '''
+                    SELECT user_id, message_text, timestamp, user_name 
+                    FROM messages 
+                    WHERE chat_id = %s AND message_hash = %s 
+                    AND timestamp > now() - interval '1 day'
+                '''
+                cursor.execute(query, (chat_id, message_hash))
+            else:
+                query = '''
+                    SELECT user_id, message_text, timestamp, user_name 
+                    FROM messages 
+                    WHERE chat_id = ? AND message_hash = ? 
+                    AND timestamp > datetime('now', '-1 day')
+                '''
+                cursor.execute(query, (chat_id, message_hash))
             
             existing_message = cursor.fetchone()
             
             if existing_message:
                 original_user_id, original_text, original_time, original_user_name = existing_message
                 
-                # Lakukan pengecekan duplikat meskipun pengirimnya adalah orang yang sama
                 # Format Waktu: 2026/02/22 10:21:23
                 tz_jakarta = pytz.timezone('Asia/Jakarta')
                 
-                original_time_dt = datetime.strptime(original_time, '%Y-%m-%d %H:%M:%S')
-                # Asumsikan DB menyimpan waktu lokal asli, jadi kita langsung format biasa
-                original_time_str = original_time_dt.strftime('%Y/%m/%d %H:%M:%S')
+                if isinstance(original_time, str):
+                    original_time_dt = datetime.strptime(original_time, '%Y-%m-%d %H:%M:%S')
+                else:
+                    original_time_dt = original_time # PostgreSQL returns datetime object
                 
+                original_time_str = original_time_dt.strftime('%Y/%m/%d %H:%M:%S')
                 current_time_str = datetime.now(tz_jakarta).strftime('%Y/%m/%d %H:%M:%S')
                 
                 response_message = (
@@ -155,20 +206,31 @@ class ProductionDuplicateBot:
                 msg = await message.reply_text(response_message)
                 logger.info(f"🚫 Duplicate detected in chat {chat_id}")
             else:
-                # Simpan pesan baru ke database menggunakan waktu Jakarta saat ini
+                # Simpan pesan baru
                 tz_jakarta = pytz.timezone('Asia/Jakarta')
                 current_time = datetime.now(tz_jakarta).strftime('%Y-%m-%d %H:%M:%S')
                 
-                cursor.execute('''
-                    INSERT OR REPLACE INTO messages 
-                    (chat_id, message_hash, message_text, user_id, timestamp, user_name)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (chat_id, message_hash, message_text, user_id, current_time, user_name))
-                self.conn.commit()
+                if self.db_type == 'postgresql':
+                    cursor.execute('''
+                        INSERT INTO messages 
+                        (chat_id, message_hash, message_text, user_id, timestamp, user_name)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (chat_id, message_hash) DO NOTHING
+                    ''', (chat_id, message_hash, message_text, user_id, current_time, user_name))
+                else:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO messages 
+                        (chat_id, message_hash, message_text, user_id, timestamp, user_name)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (chat_id, message_hash, message_text, user_id, current_time, user_name))
+                    self.conn.commit()
                 
-            # Bersihkan pesan yang lebih dari 7 hari
-            cursor.execute('DELETE FROM messages WHERE timestamp < datetime("now", "-7 days")')
-            self.conn.commit()
+            # Bersihkan pesan lama
+            if self.db_type == 'postgresql':
+                cursor.execute("DELETE FROM messages WHERE timestamp < now() - interval '7 days'")
+            else:
+                cursor.execute('DELETE FROM messages WHERE timestamp < datetime("now", "-7 days")')
+                self.conn.commit()
             
         except Exception as e:
             logger.error(f"Error handling message: {e}")
@@ -201,6 +263,9 @@ class ProductionDuplicateBot:
 
 if __name__ == "__main__":
     try:
+        # Jalankan server flask di thread terpisah agar bot tidak mati di HuggingFace
+        threading.Thread(target=run_server, daemon=True).start()
+        
         bot = ProductionDuplicateBot()
         
         # Pilih mode berdasarkan environment

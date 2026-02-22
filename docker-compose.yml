@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-duplicate-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DB_PATH=/app/data/messages.db
+      - USE_WEBHOOK=false
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Add nginx for webhook
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - telegram-bot
