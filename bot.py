@@ -1,287 +1,176 @@
 import os
+import sys
 import logging
 import asyncio
-from dotenv import load_dotenv
-from telegram.ext import Application, MessageHandler, filters
-from telegram import Update
-import sqlite3
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import hashlib
-from datetime import datetime, timedelta
-import signal
-import sys
-import pytz
-import urllib.parse as urlparse
-from flask import Flask
-import threading
+from datetime import datetime
+from flask import Flask, request, jsonify
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+import psycopg2
 
-# Flask app untuk health check (HuggingFace/Koyeb)
-server = Flask(__name__)
-
-@server.route('/')
-def health():
-    return "Bot is alive!", 200
-
-def run_server():
-    port = int(os.getenv('PORT', 7860))
-    server.run(host='0.0.0.0', port=port)
-
-# Setup logging
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-except AttributeError:
-    pass
-
+# 1. Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-
 logger = logging.getLogger(__name__)
 
-class ProductionDuplicateBot:
-    def __init__(self):
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-        load_dotenv(env_path)
-        self.token = os.getenv('BOT_TOKEN', '').strip()
-        if not self.token:
-            raise ValueError("❌ BOT_TOKEN environment variable not set")
-            
-        # Network Check
-        try:
-            import socket
-            hostname = "api.telegram.org"
-            ip = socket.gethostbyname(hostname)
-            logger.info(f"🌐 DNS Check: {hostname} resolved to {ip}")
-        except Exception as e:
-            logger.warning(f"⚠️ DNS Check Failed for {hostname}: {e}")
-            
-        self.app = Application.builder().token(self.token).build()
-        self.setup_database()
-        self.setup_handlers()
-        self.setup_error_handler()
-        self.setup_signal_handlers()
+# 2. Flask Setup (WSGI compatibility for PythonAnywhere)
+app = Flask(__name__)
+
+# 3. Load Environment
+load_dotenv()
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
+DATABASE_URL = os.getenv('DATABASE_URL')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN not set!")
+
+# 4. Telegram Application Setup
+# We'll initialize this as global to reuse it across requests
+telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    try:
+        conn = get_db_connection()
+        conn.autocommit = True
+        cursor = conn.cursor()
+        # Remove UNIQUE constraint to track history
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                message_hash TEXT,
+                message_text TEXT,
+                user_id BIGINT,
+                timestamp TIMESTAMP,
+                user_name TEXT DEFAULT 'Unknown'
+            )
+        ''')
+        # Create an index for faster searching
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_hash ON messages(chat_id, message_hash)')
+        conn.close()
+        logger.info("📊 Database initialized (PostgreSQL)")
+    except Exception as e:
+        logger.error(f"❌ DB Init Error: {e}")
+
+# Call init once
+if DATABASE_URL:
+    init_db()
+
+# 5. Bot Logic
+async def check_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.message.chat_id
+    text = update.message.text
+    user_id = update.message.from_user.id
+    user_name = update.message.from_user.full_name
+    
+    msg_hash = hashlib.md5(text.encode()).hexdigest()
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        logger.info("🤖 Bot initialized successfully")
-        
-    def setup_database(self):
-        """Setup database (PostgreSQL if DATABASE_URL exists, otherwise SQLite)"""
-        db_url = os.getenv('DATABASE_URL')
-        
-        if db_url:
-            logger.info("🔌 Connecting to PostgreSQL (Supabase)...")
-            self.db_type = 'postgresql'
-            self.conn = psycopg2.connect(db_url)
-            self.conn.autocommit = True
-        else:
-            logger.info("📁 Connecting to SQLite...")
-            self.db_type = 'sqlite'
-            db_path = os.getenv('DB_PATH', 'messages.db')
-            self.conn = sqlite3.connect(db_path, check_same_thread=False)
-            
-        cursor = self.conn.cursor()
-        
-        if self.db_type == 'postgresql':
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS messages (
-                    id SERIAL PRIMARY KEY,
-                    chat_id BIGINT,
-                    message_hash TEXT,
-                    message_text TEXT,
-                    user_id BIGINT,
-                    timestamp TIMESTAMP,
-                    user_name TEXT DEFAULT 'Unknown',
-                    UNIQUE(chat_id, message_hash)
-                )
-            ''')
-        else:
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER,
-                    message_hash TEXT,
-                    message_text TEXT,
-                    user_id INTEGER,
-                    timestamp DATETIME,
-                    UNIQUE(chat_id, message_hash)
-                )
-            ''')
-            # Migrasi SQLite: Tambahkan kolom user_name jika belum ada
-            try:
-                cursor.execute('ALTER TABLE messages ADD COLUMN user_name TEXT DEFAULT "Unknown"')
-            except sqlite3.OperationalError:
-                pass # Kolom sudah ada
-        
-        logger.info(f"📊 Database initialized ({self.db_type})")
-        
-    def setup_handlers(self):
-        """Setup handler untuk pesan teks"""
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        
-    def setup_error_handler(self):
-        """Handle errors untuk production"""
-        async def error_handler(update: Update, context):
-            logger.error(f"Error: {context.error}")
-            
-        self.app.add_error_handler(error_handler)
-        
-    def setup_signal_handlers(self):
-        """Handle shutdown signals"""
-        def signal_handler(signum, frame):
-            logger.info("🛑 Received shutdown signal")
-            asyncio.create_task(self.graceful_shutdown())
-            
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-    async def graceful_shutdown(self):
-        """Shutdown yang graceful"""
-        logger.info("🔚 Shutting down gracefully...")
-        self.conn.close()
-        await self.app.shutdown()
-        sys.exit(0)
-        
-    def generate_message_hash(self, text):
-        """Generate hash untuk pesan untuk deteksi duplikat"""
-        normalized_text = ' '.join(text.lower().split())
-        return hashlib.md5(normalized_text.encode()).hexdigest()
-        
-    async def handle_message(self, update: Update, context):
-        """Handle incoming messages"""
-        try:
-            message = update.message
-            if not message or not message.text:
-                return
-                
-            chat_id = message.chat_id
-            user_id = message.from_user.id
-            user_name = message.from_user.first_name if message.from_user.first_name else str(user_id)
-            message_text = message.text
-            
-            # Skip jika pesan terlalu pendek (dikurangi jadi 5 agar fitur No HP terdeteksi)
-            if len(message_text.strip()) < 5:  
-                return
-                
-            message_hash = self.generate_message_hash(message_text)
-            
-            cursor = self.conn.cursor()
-            
-            # Pengecekan 24 jam terakhir (Sintaks berbeda antara PG dan SQLite)
-            if self.db_type == 'postgresql':
-                query = '''
-                    SELECT user_id, message_text, timestamp, user_name 
-                    FROM messages 
-                    WHERE chat_id = %s AND message_hash = %s 
-                    AND timestamp > now() - interval '1 day'
-                '''
-                cursor.execute(query, (chat_id, message_hash))
-            else:
-                query = '''
-                    SELECT user_id, message_text, timestamp, user_name 
-                    FROM messages 
-                    WHERE chat_id = ? AND message_hash = ? 
-                    AND timestamp > datetime('now', '-1 day')
-                '''
-                cursor.execute(query, (chat_id, message_hash))
-            
-            existing_message = cursor.fetchone()
-            
-            if existing_message:
-                original_user_id, original_text, original_time, original_user_name = existing_message
-                
-                # Format Waktu: 2026/02/22 10:21:23
-                tz_jakarta = pytz.timezone('Asia/Jakarta')
-                
-                if isinstance(original_time, str):
-                    original_time_dt = datetime.strptime(original_time, '%Y-%m-%d %H:%M:%S')
-                else:
-                    original_time_dt = original_time # PostgreSQL returns datetime object
-                
-                original_time_str = original_time_dt.strftime('%Y/%m/%d %H:%M:%S')
-                current_time_str = datetime.now(tz_jakarta).strftime('%Y/%m/%d %H:%M:%S')
-                
-                response_message = (
-                    f"❌Nomor sudah pernah bergabung❌\n"
-                    f"Nomor yang terdeteksi: {original_text}\n"
-                    f"{original_user_name} : {original_time_str} (pertama kali)\n"
-                    f"{user_name} : {current_time_str} (kali ini)"
-                )
-                
-                msg = await message.reply_text(response_message)
-                logger.info(f"🚫 Duplicate detected in chat {chat_id}")
-            else:
-                # Simpan pesan baru
-                tz_jakarta = pytz.timezone('Asia/Jakarta')
-                current_time = datetime.now(tz_jakarta).strftime('%Y-%m-%d %H:%M:%S')
-                
-                if self.db_type == 'postgresql':
-                    cursor.execute('''
-                        INSERT INTO messages 
-                        (chat_id, message_hash, message_text, user_id, timestamp, user_name)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (chat_id, message_hash) DO NOTHING
-                    ''', (chat_id, message_hash, message_text, user_id, current_time, user_name))
-                else:
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO messages 
-                        (chat_id, message_hash, message_text, user_id, timestamp, user_name)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (chat_id, message_hash, message_text, user_id, current_time, user_name))
-                    self.conn.commit()
-                
-            # Bersihkan pesan lama
-            if self.db_type == 'postgresql':
-                cursor.execute("DELETE FROM messages WHERE timestamp < now() - interval '7 days'")
-            else:
-                cursor.execute('DELETE FROM messages WHERE timestamp < datetime("now", "-7 days")')
-                self.conn.commit()
-            
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
-        
-    def run_polling(self):
-        """Jalankan dengan polling (untuk development)"""
-        logger.info("🔄 Starting bot with polling...")
-        self.app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
+        # 1. Store current occurrence
+        cursor.execute(
+            "INSERT INTO messages (chat_id, message_hash, message_text, user_id, timestamp, user_name) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (chat_id, msg_hash, text, user_id, datetime.now(), user_name)
         )
-        
-    def run_webhook(self):
-        """Jalankan dengan webhook (untuk production)"""
-        webhook_url = os.getenv('WEBHOOK_URL')
-        port = int(os.getenv('PORT', 8080))
-        
-        if not webhook_url:
-            logger.warning("⚠️ WEBHOOK_URL not set, falling back to polling")
-            return self.run_polling()
-            
-        logger.info(f"🌐 Starting bot with webhook: {webhook_url}")
-        self.app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=self.token,
-            webhook_url=f"{webhook_url}/{self.token}",
-            drop_pending_updates=True
+        conn.commit()
+
+        # 2. Fetch all occurrences (including the one just inserted)
+        cursor.execute(
+            "SELECT user_name, timestamp FROM messages WHERE chat_id = %s AND message_hash = %s ORDER BY timestamp ASC",
+            (chat_id, msg_hash)
         )
+        history = cursor.fetchall()
+        
+        # If more than 1 occurrence, it's a duplicate
+        if len(history) > 1:
+            # Build the message string
+            msg_parts = [
+                "❌**DETEKSI DITEMUKAN**❌",
+                f"Isi pesan : {text}",
+                ""
+            ]
+            
+            # Label mappings
+            for i, (u_name, u_time) in enumerate(history):
+                time_str = u_time.strftime("%H:%M:%S")
+                if i == 0:
+                    label = "Pengirim pertama kali"
+                elif i == len(history) - 1:
+                    label = "Pengirim saat ini"
+                elif i == 1:
+                    label = "pengirim kedua kali"
+                else:
+                    # After 2, we just list them or show dst if list is too long
+                    # For now, let's follow the user's specific request structure
+                    if i == 2 and len(history) > 4:
+                        msg_parts.append("...")
+                        continue
+                    elif i > 2 and i < len(history) - 1 and len(history) > 4:
+                        continue
+                    label = f"pengirim ke-{i+1}"
+
+                msg_parts.append(f"{u_name} : {label} {time_str}")
+
+            await update.message.reply_text("\n".join(msg_parts), parse_mode='Markdown')
+            
+        conn.close()
+    except Exception as e:
+        logger.error(f"❌ Error checking duplicate: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Bot Duplicate Detector Aktif! Tambahkan saya ke grup agar saya bisa bekerja.")
+
+# Setup Handlers
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), check_duplicate))
+
+# 6. Webhook Routes
+@app.route('/', methods=['GET'])
+def index():
+    return "Bot is running via Webhook!", 200
+
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+async def webhook():
+    """Handle incoming Telegram updates"""
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        await telegram_app.process_update(update)
+        return "OK", 200
+
+# 7. Helper for setting webhook automatically
+async def setup_webhook():
+    if WEBHOOK_URL:
+        bot = Bot(token=BOT_TOKEN)
+        full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
+        await bot.set_webhook(url=full_url)
+        logger.info(f"🌐 Webhook set to: {full_url}")
+
+# This will run once when the app starts
+if WEBHOOK_URL:
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(setup_webhook())
+        else:
+            loop.run_until_complete(setup_webhook())
+    except Exception as e:
+        logger.error(f"⚠️ Webhook setup failed: {e}")
 
 if __name__ == "__main__":
-    try:
-        # Jalankan server flask di thread terpisah agar bot tidak mati di HuggingFace
-        threading.Thread(target=run_server, daemon=True).start()
-        
-        bot = ProductionDuplicateBot()
-        
-        # Pilih mode berdasarkan environment
-        if os.getenv('USE_WEBHOOK', 'false').lower() == 'true':
-            bot.run_webhook()
-        else:
-            bot.run_polling()
-            
-    except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}")
-        sys.exit(1)
+    # Local usage only
+    app.run(port=7860)
