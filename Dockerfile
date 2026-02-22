@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+EXPOSE 7860
+
 # Use User ID 1000 for HuggingFace compatibility
 RUN useradd -m -u 1000 user
 USER user
