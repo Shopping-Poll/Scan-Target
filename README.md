@@ -1,4 +1,4 @@
-\---
+---
 title: Telegram Duplicate Bot
 emoji: 🤖
 colorFrom: blue
